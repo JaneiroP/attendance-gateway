@@ -26,9 +26,11 @@ import com.ohmdevs.attendance.security.DeviceAuthenticationInterceptor;
 class PunchIngestController {
 
     private final PunchIngestService service;
+    private final IngestMetrics metrics;
 
-    PunchIngestController(PunchIngestService service) {
+    PunchIngestController(PunchIngestService service, IngestMetrics metrics) {
         this.service = service;
+        this.metrics = metrics;
     }
 
     /**
@@ -43,7 +45,10 @@ class PunchIngestController {
         List<RawPunch> punches = request.punches().stream()
                 .map(punch -> new RawPunch(punch.userCode(), punch.punchedAt(), punch.type()))
                 .toList();
-        return service.ingest(device, punches);
+        IngestResult result = service.ingest(device, punches);
+        // Counted here, after the transaction committed, so a rollback is never counted.
+        metrics.record(result);
+        return result;
     }
 
     record PunchBatchRequest(@NotEmpty List<@Valid PunchRequest> punches) {

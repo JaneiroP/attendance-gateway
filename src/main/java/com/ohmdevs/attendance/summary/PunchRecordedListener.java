@@ -1,7 +1,15 @@
 package com.ohmdevs.attendance.summary;
 
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.listener.BatchListenerFailedException;
 import org.springframework.stereotype.Component;
+
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -15,15 +23,47 @@ class PunchRecordedListener {
 
     private final DailySummaryProjector projector;
     private final JsonMapper json;
+    private final Counter applied;
+    private final Counter redelivered;
 
-    PunchRecordedListener(DailySummaryProjector projector, JsonMapper json) {
+    PunchRecordedListener(DailySummaryProjector projector, JsonMapper json, MeterRegistry registry) {
         this.projector = projector;
         this.json = json;
+        this.applied = result(registry, "applied");
+        this.redelivered = result(registry, "redelivered");
     }
 
+    private static Counter result(MeterRegistry registry, String result) {
+        return Counter.builder("attendance.summary.events")
+                .description("Punch events consumed by the daily summary, by whether they were new")
+                .tag("result", result)
+                .register(registry);
+    }
+
+    /**
+     * Receives one poll's worth of records. If one of them cannot be read, the
+     * readable ones before it are applied, and the error handler is told which
+     * record failed: it sends that one to the dead-letter topic and has the
+     * rest delivered again.
+     */
     @KafkaListener(topics = Topics.PUNCH_RECORDED)
-    void onPunchRecorded(String payload) {
-        projector.apply(parse(payload));
+    void onPunchRecorded(List<ConsumerRecord<String, String>> records) {
+        List<PunchRecorded> events = new ArrayList<>(records.size());
+        for (int index = 0; index < records.size(); index++) {
+            try {
+                events.add(parse(records.get(index).value()));
+            } catch (UnreadableEventException unreadable) {
+                apply(events);
+                throw new BatchListenerFailedException("Unreadable record in batch", unreadable, index);
+            }
+        }
+        apply(events);
+    }
+
+    private void apply(List<PunchRecorded> events) {
+        int newEvents = projector.applyAll(events);
+        applied.increment(newEvents);
+        redelivered.increment(events.size() - newEvents);
     }
 
     private PunchRecorded parse(String payload) {

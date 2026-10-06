@@ -6,9 +6,9 @@ clock's own code for each person. This service stores each punch exactly once, c
 it to UTC, resolves the employee, sets aside what it cannot accept with the reason, and
 publishes a clean event to Kafka for every punch it stores.
 
-**Status: milestone 2 of 4.** Ingestion, idempotency, quarantine, event publication and
-the daily summary consumer are done and tested. Metrics, a clock simulator and load
-numbers are not built yet; see [Roadmap](#roadmap).
+**Status: milestone 3 of 4.** Ingestion, idempotency, quarantine, event publication, the
+daily summary consumer, metrics and a clock simulator are done and tested. Webhooks for
+downstream systems are not built; see [Roadmap](#roadmap).
 
 ```text
 clocks --HTTP--> ingest --> PostgreSQL (punch + outbox_event, one transaction)
@@ -45,6 +45,7 @@ repeats the cleanup.
 | Quarantine | A punch with no employee mapping, or dated in the future beyond a tolerance, is kept with its reason. After the mapping is fixed, `POST /api/v1/quarantine/reprocess` moves it through. |
 | Events | Every newly stored punch is published to `attendance.punch.recorded.v1`, keyed by employee. The contract is in [docs/events.md](docs/events.md). |
 | Daily summary | A consumer builds, per employee and day, first in, last out and worked minutes. `GET /api/v1/daily-summaries?employeeId=&from=&to=` reads it. |
+| Operations | Prometheus metrics at `/actuator/prometheus`: punches by outcome, outbox backlog and the age of its oldest event, events consumed, Kafka client metrics. Every request has a correlation id on its log lines and in the `X-Request-Id` response header. JSON logs with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`. |
 
 ## Design decisions
 
@@ -87,12 +88,26 @@ same result in any arrival order, which an incremental update would not.
 `max.block.ms` of 60 seconds, the first send during an outage held a database
 transaction open for a minute. It is set to 5 seconds here. The outage test found this.
 
+**The consumer works per batch, not per event.** The first version applied one event
+per database transaction and committed one Kafka offset per event. Under load it
+managed about 65 events per second while ingestion took in thousands, and the backlog
+only grew. It now takes each poll as a batch: one transaction, one recomputation per
+affected day, one offset commit. Idempotency is what makes that safe, because a batch
+that is delivered again changes nothing. The load test found this.
+
 **The consumer does not read the ingest tables.** It keeps its own copy of what the
 events carry. It lives in this service for now, and could move out with its tables.
 
 ## Running it
 
 Requirements: JDK 25 and Docker.
+
+```bash
+docker compose --profile app up -d --build   # PostgreSQL, Kafka and the service
+```
+
+The service listens on `localhost:8080` with the administration key `dev-admin-key`.
+To run it from source instead, start only the dependencies:
 
 ```bash
 docker compose up -d                         # PostgreSQL and Kafka
@@ -125,6 +140,40 @@ API documentation is served at `/swagger-ui.html`.
 
 If `ATTENDANCE_ADMIN_API_KEY` is not set, every administration request is rejected.
 
+## Clock simulator and measured throughput
+
+`tools/ClockSimulator.java` plays a fleet of clocks against a running service: every
+clock sends at once, batches are shuffled, and one batch in five is sent twice. It has
+no dependencies and needs no build:
+
+```bash
+java tools/ClockSimulator.java --devices 20 --punches-per-device 5000
+```
+
+It exits non-zero unless every distinct punch was accepted exactly once, every event was
+published, and the summary consumer applied every event exactly once.
+
+Three consecutive runs of that command, 100,000 distinct punches each in batches of 100
+from 20 concurrent clocks:
+
+| | Range over three runs |
+|---|---|
+| Ingestion, distinct punches stored | 5,700 to 7,800 per second |
+| Ingestion, including the duplicates sent | 6,900 to 9,300 punches per second |
+| Request latency for a 100-punch batch | p50 190 to 266 ms, p99 477 to 668 ms |
+| Events published to Kafka | 2,900 to 3,400 per second |
+| Punch received to summary updated, whole run | 2,700 to 2,850 events per second |
+
+All three runs passed the exactly-once check, and afterwards the database held the same
+number of punches, consumed events and punches counted in summaries.
+
+Read these as what one laptop does, not as capacity: an Intel i5-10310U (4 cores, 8
+threads) with 16 GB, running the service, PostgreSQL, Kafka and the simulator together
+under Docker Desktop on Windows, one service instance, default JVM settings. Ingestion
+is faster than publication, so under sustained load the outbox publisher is the limit:
+it is a single thread that sends 200 events and waits for the broker before the next
+200.
+
 ## Tests
 
 ```bash
@@ -140,7 +189,7 @@ key and summary logic has plain unit tests.
 
 1. **Ingestion** — done.
 2. **Events** — done.
-3. **Operations** — metrics, structured logs, a clock simulator, measured throughput.
+3. **Operations** — done.
 4. **Integration** — signed webhooks for downstream systems.
 
 ## Limitations
@@ -148,6 +197,8 @@ key and summary logic has plain unit tests.
 - Single tenant.
 - One JSON format for punches. No vendor protocol is implemented.
 - The administration API uses one shared key from configuration.
+- `/actuator/prometheus` and the API documentation are open. In a deployment they
+  belong behind the network boundary or on a separate management port.
 - One outbox publisher. A second instance would not lose or duplicate work, but events
   could be published out of insertion order.
 - Published outbox rows are never deleted.

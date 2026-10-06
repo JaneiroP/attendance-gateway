@@ -36,14 +36,16 @@ class OutboxPublisher {
     private final KafkaTemplate<String, String> kafka;
     private final TransactionTemplate transaction;
     private final OutboxProperties properties;
+    private final OutboxMetrics metrics;
     private final Clock clock;
 
     OutboxPublisher(Outbox outbox, KafkaTemplate<String, String> kafka, TransactionTemplate transaction,
-                    OutboxProperties properties, Clock clock) {
+                    OutboxProperties properties, OutboxMetrics metrics, Clock clock) {
         this.outbox = outbox;
         this.kafka = kafka;
         this.transaction = transaction;
         this.properties = properties;
+        this.metrics = metrics;
         this.clock = clock;
     }
 
@@ -75,7 +77,9 @@ class OutboxPublisher {
             outbox.markPublished(pending, clock.instant());
             return pending.size();
         });
-        return published == null ? 0 : published;
+        int count = published == null ? 0 : published;
+        metrics.published(count);
+        return count;
     }
 
     private void awaitAll(List<CompletableFuture<?>> sends) {

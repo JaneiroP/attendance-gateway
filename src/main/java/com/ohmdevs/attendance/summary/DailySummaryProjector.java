@@ -5,7 +5,10 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.TreeSet;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -37,39 +40,86 @@ public class DailySummaryProjector {
                                int workedMinutes, int punchCount) {
     }
 
-    /**
-     * Applies one event. Safe to call again with the same event: the second
-     * call finds the event id already stored and changes nothing.
-     *
-     * @return {@code false} when the event had been applied before
-     */
-    @Transactional
-    public boolean apply(PunchRecorded event) {
+    /** One employee's work day: the unit a summary is computed for. */
+    private record Day(String employeeId, LocalDate workDate) implements Comparable<Day> {
+
         // The work day is the calendar day at the device. A shift that crosses
         // midnight is split across two days; that is a known limitation.
-        LocalDate workDate = event.punchedAtLocal().toLocalDate();
+        static Day of(PunchRecorded event) {
+            return new Day(event.employeeId(), event.punchedAtLocal().toLocalDate());
+        }
 
+        @Override
+        public int compareTo(Day other) {
+            int byEmployee = employeeId.compareTo(other.employeeId);
+            return byEmployee != 0 ? byEmployee : workDate.compareTo(other.workDate);
+        }
+    }
+
+    /** Applies one event; see {@link #applyAll}. Returns {@code false} when it had been applied before. */
+    @Transactional
+    public boolean apply(PunchRecorded event) {
+        return applyAll(List.of(event)) == 1;
+    }
+
+    /**
+     * Applies a batch of events in one transaction and returns how many were
+     * new. Safe to call again with events already applied: their ids are
+     * already stored, they insert nothing, and no summary is touched for them.
+     *
+     * <p>Working per batch is what makes the consumer keep up: one commit and
+     * one recomputation per affected day, however many events the batch holds.
+     */
+    @Transactional
+    public int applyAll(List<PunchRecorded> events) {
+        if (events.isEmpty()) {
+            return 0;
+        }
         // One writer per employee and day. Partitioning by employee already
-        // gives that in normal operation; the lock covers a consumer rebalance,
-        // where two consumers can briefly hold the same partition.
-        jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", row -> {
-        }, event.employeeId() + "|" + workDate);
+        // gives that in normal operation; the locks cover a consumer rebalance,
+        // where two consumers can briefly hold the same partition. They are
+        // taken in a fixed order so two batches cannot deadlock on them.
+        TreeSet<Day> days = new TreeSet<>();
+        events.forEach(event -> days.add(Day.of(event)));
+        for (Day day : days) {
+            jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", row -> {
+            }, day.employeeId() + "|" + day.workDate());
+        }
 
-        int inserted = jdbc.update("""
+        int[][] counts = jdbc.batchUpdate("""
                         INSERT INTO summary_punch (event_id, employee_id, work_date, punched_at_utc, type)
                         VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT (event_id) DO NOTHING
                         """,
-                event.eventId(), event.employeeId(), workDate, utc(event.punchedAtUtc()), event.type());
-        if (inserted == 0) {
-            return false;
-        }
+                events, events.size(), (statement, event) -> {
+                    statement.setObject(1, event.eventId());
+                    statement.setString(2, event.employeeId());
+                    statement.setObject(3, event.punchedAtLocal().toLocalDate());
+                    statement.setObject(4, utc(event.punchedAtUtc()));
+                    statement.setString(5, event.type());
+                });
+        int[] inserted = Arrays.stream(counts).flatMapToInt(Arrays::stream).toArray();
 
+        TreeSet<Day> changed = new TreeSet<>();
+        List<PunchRecorded> applied = new ArrayList<>();
+        for (int i = 0; i < inserted.length; i++) {
+            if (inserted[i] > 0) {
+                applied.add(events.get(i));
+                changed.add(Day.of(events.get(i)));
+            }
+        }
+        changed.forEach(this::recompute);
+        return applied.size();
+    }
+
+    private void recompute(Day day) {
+        String employeeId = day.employeeId();
+        LocalDate workDate = day.workDate();
         List<Punch> punches = jdbc.query(
                 "SELECT punched_at_utc, type FROM summary_punch WHERE employee_id = ? AND work_date = ?",
                 (row, n) -> new Punch(row.getObject("punched_at_utc", OffsetDateTime.class).toInstant(),
                         row.getString("type")),
-                event.employeeId(), workDate);
+                employeeId, workDate);
         Summary summary = DailySummaryCalculator.summarize(punches);
 
         jdbc.update("""
@@ -83,9 +133,8 @@ public class DailySummaryProjector {
                                punch_count = EXCLUDED.punch_count,
                                updated_at = EXCLUDED.updated_at
                         """,
-                event.employeeId(), workDate, utc(summary.firstIn()), utc(summary.lastOut()),
+                employeeId, workDate, utc(summary.firstIn()), utc(summary.lastOut()),
                 summary.workedMinutes(), summary.punchCount(), utc(clock.instant()));
-        return true;
     }
 
     @Transactional(readOnly = true)
