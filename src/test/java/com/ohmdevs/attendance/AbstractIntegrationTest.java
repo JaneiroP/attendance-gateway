@@ -17,15 +17,17 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
- * Base for tests that go through real HTTP against a real PostgreSQL.
+ * Base for tests that go through real HTTP against a real PostgreSQL and a real Kafka.
  *
- * <p>The behavior under test is {@code ON CONFLICT} and row locking, which an
- * in-memory database does not reproduce. The container is started once for
- * the whole run and never stopped by hand: the Spring context is cached across
- * test classes, and a container tied to one class would be gone for the next.
+ * <p>The behavior under test is {@code ON CONFLICT}, row locking and broker
+ * delivery, which in-memory stand-ins do not reproduce. The containers are
+ * started once for the whole run and never stopped by hand: the Spring context
+ * is cached across test classes, and a container tied to one class would be
+ * gone for the next.
  *
  * <p>Tests do not clean the database. Each one registers its own device and
  * site, so they cannot see each other's rows.
@@ -40,9 +42,13 @@ public abstract class AbstractIntegrationTest {
     @SuppressWarnings("resource")
     private static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17-alpine");
 
+    @SuppressWarnings("resource")
+    protected static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:4.0.0");
+
     static {
         if (DockerClientFactory.instance().isDockerAvailable()) {
             POSTGRES.start();
+            KAFKA.start();
         }
     }
 
@@ -52,6 +58,11 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("attendance.admin.api-key", () -> ADMIN_KEY);
+        registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
+        // Short enough that a test can watch the publisher give up and try again.
+        registry.add("attendance.outbox.poll-interval", () -> "200ms");
+        registry.add("attendance.outbox.send-timeout", () -> "3s");
+        registry.add("spring.kafka.producer.properties.max.block.ms", () -> "2000");
     }
 
     @Autowired
@@ -110,6 +121,26 @@ public abstract class AbstractIntegrationTest {
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-Admin-Key", ADMIN_KEY);
         return headers;
+    }
+
+    public record DailySummaryDto(String employeeId, String workDate, String firstIn, String lastOut,
+                                  int workedMinutes, int punchCount) {
+    }
+
+    protected static String newEmployeeId() {
+        return "EMP-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    /** The summary of one employee for one day, or {@code null} while it does not exist yet. */
+    protected DailySummaryDto dailySummary(String employeeId, String day) {
+        DailySummaryDto[] found = rest.exchange(
+                "/api/v1/daily-summaries?employeeId={employee}&from={day}&to={day}", HttpMethod.GET,
+                new HttpEntity<>(adminHeaders()), DailySummaryDto[].class, employeeId, day, day).getBody();
+        return found == null || found.length == 0 ? null : found[0];
+    }
+
+    protected int unpublishedEvents() {
+        return jdbc.queryForObject("SELECT count(*) FROM outbox_event WHERE published_at IS NULL", Integer.class);
     }
 
     protected int storedPunches(TestDevice device) {

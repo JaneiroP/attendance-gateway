@@ -7,6 +7,7 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
@@ -45,25 +46,33 @@ class PunchStore {
                            PunchType type, QuarantineReason reason, String status, Instant receivedAt) {
     }
 
+    record StoredPunch(UUID id, AcceptedPunch punch) {
+    }
+
     /**
-     * Inserts the punches that are not already stored and returns how many were new.
+     * Inserts the punches that are not already stored and returns the ones that were new.
      *
-     * <p>The count is exact because each row is its own statement in the JDBC
-     * batch. It would stop being exact with the driver option
+     * <p>Which rows were new is read from the per-statement update counts,
+     * which are exact because each row is its own statement in the JDBC batch.
+     * That stops being true with the driver option
      * {@code reWriteBatchedInserts=true}, which merges them into one statement.
      */
-    int insertPunches(List<AcceptedPunch> punches, Instant receivedAt) {
+    List<StoredPunch> insertPunches(List<AcceptedPunch> punches, Instant receivedAt) {
         if (punches.isEmpty()) {
-            return 0;
+            return List.of();
         }
+        List<StoredPunch> candidates = punches.stream()
+                .map(punch -> new StoredPunch(UUID.randomUUID(), punch))
+                .toList();
         int[][] counts = jdbc.batchUpdate("""
                         INSERT INTO punch (id, device_id, site_code, user_code, employee_id,
                                            punched_at_local, punched_at_utc, type, received_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT ON CONSTRAINT uq_punch_identity DO NOTHING
                         """,
-                punches, JDBC_BATCH_SIZE, (statement, punch) -> {
-                    statement.setObject(1, UUID.randomUUID());
+                candidates, JDBC_BATCH_SIZE, (statement, candidate) -> {
+                    AcceptedPunch punch = candidate.punch();
+                    statement.setObject(1, candidate.id());
                     statement.setObject(2, punch.deviceId());
                     statement.setString(3, punch.siteCode());
                     statement.setString(4, punch.userCode());
@@ -73,7 +82,15 @@ class PunchStore {
                     statement.setString(8, punch.type().name());
                     setInstant(statement, 9, receivedAt);
                 });
-        return Arrays.stream(counts).flatMapToInt(Arrays::stream).filter(count -> count > 0).sum();
+        // The counts come back in the order the rows were sent, one array per JDBC batch.
+        int[] flatCounts = Arrays.stream(counts).flatMapToInt(Arrays::stream).toArray();
+        List<StoredPunch> inserted = new ArrayList<>();
+        for (int i = 0; i < flatCounts.length; i++) {
+            if (flatCounts[i] > 0) {
+                inserted.add(candidates.get(i));
+            }
+        }
+        return inserted;
     }
 
     /** A punch that is already quarantined stays as it is; a retry must not reopen or duplicate it. */

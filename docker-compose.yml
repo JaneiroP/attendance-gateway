@@ -1,4 +1,4 @@
-# Local development database. The service itself runs from the IDE or with
+# Local development dependencies. The service itself runs from the IDE or with
 # `./mvnw spring-boot:run`, using the defaults in application.properties.
 services:
   postgres:
@@ -16,6 +16,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Single-node Kafka in KRaft mode. The image's default configuration
+  # advertises localhost:9092, which is what a service on the host needs.
+  kafka:
+    image: apache/kafka:4.0.0
+    ports:
+      - "9092:9092"
 
 volumes:
   attendance-db:

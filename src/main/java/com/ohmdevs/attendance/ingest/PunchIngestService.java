@@ -23,6 +23,7 @@ import com.ohmdevs.attendance.ingest.PunchClassifier.Rejected;
 import com.ohmdevs.attendance.ingest.PunchStore.AcceptedPunch;
 import com.ohmdevs.attendance.ingest.PunchStore.PendingQuarantine;
 import com.ohmdevs.attendance.ingest.PunchStore.RejectedPunch;
+import com.ohmdevs.attendance.ingest.PunchStore.StoredPunch;
 import com.ohmdevs.attendance.mapping.EmployeeMappings;
 
 @Service
@@ -42,12 +43,15 @@ public class PunchIngestService {
             .thenComparing(AcceptedPunch::type);
 
     private final PunchStore store;
+    private final PunchEvents events;
     private final EmployeeMappings mappings;
     private final IngestProperties properties;
     private final Clock clock;
 
-    PunchIngestService(PunchStore store, EmployeeMappings mappings, IngestProperties properties, Clock clock) {
+    PunchIngestService(PunchStore store, PunchEvents events, EmployeeMappings mappings,
+                       IngestProperties properties, Clock clock) {
         this.store = store;
+        this.events = events;
         this.mappings = mappings;
         this.properties = properties;
         this.clock = clock;
@@ -97,10 +101,12 @@ public class PunchIngestService {
         }
         accepted.sort(LOCK_ORDER);
 
-        int inserted = store.insertPunches(accepted, now);
+        List<StoredPunch> stored = store.insertPunches(accepted, now);
+        // Same transaction as the insert: an event exists exactly when its punch does.
+        events.recorded(stored, now);
         store.insertQuarantined(rejected, now);
         store.markDeviceSeen(device.id(), now);
-        return new IngestResult(punches.size(), inserted, accepted.size() - inserted, rejected.size());
+        return new IngestResult(punches.size(), stored.size(), accepted.size() - stored.size(), rejected.size());
     }
 
     /**
@@ -131,7 +137,7 @@ public class PunchIngestService {
         }
         accepted.sort(LOCK_ORDER);
 
-        store.insertPunches(accepted, now);
+        events.recorded(store.insertPunches(accepted, now), now);
         store.markResolved(resolved, now);
         return new ReprocessResult(pending.size(), resolved.size());
     }
