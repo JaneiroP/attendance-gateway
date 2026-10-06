@@ -1,0 +1,21 @@
+# Local development database. The service itself runs from the IDE or with
+# `./mvnw spring-boot:run`, using the defaults in application.properties.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: attendance
+      POSTGRES_USER: attendance
+      POSTGRES_PASSWORD: attendance
+    ports:
+      - "5432:5432"
+    volumes:
+      - attendance-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U attendance -d attendance"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  attendance-db:
