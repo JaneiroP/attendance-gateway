@@ -48,6 +48,7 @@ repeats the cleanup.
 | Quarantine | A punch with no employee mapping, or dated in the future beyond a tolerance, is kept with its reason. After the mapping is fixed, `POST /api/v1/quarantine/reprocess` moves it through. |
 | Events | Every newly stored punch is published to `attendance.punch.recorded.v1`, keyed by employee. The contract is in [docs/events.md](docs/events.md). |
 | Daily summary | A consumer builds, per employee and day, first in, last out and worked minutes. `GET /api/v1/daily-summaries?employeeId=&from=&to=` reads it. |
+| Punch query | `GET /api/v1/punches?employeeId=&from=&to=` reads one employee's accepted punches in a time range, oldest first, in pages linked by a cursor. |
 | Webhooks | For systems that cannot consume Kafka: the same events, in batches, posted to a registered address and signed with HMAC-SHA256. Failed requests are retried with growing pauses; an endpoint that keeps failing is suspended and loses nothing once resumed. The contract is in [docs/webhooks.md](docs/webhooks.md). |
 | Operations | Prometheus metrics at `/actuator/prometheus`: punches by outcome, outbox backlog and the age of its oldest event, events consumed, webhook attempts and backlog, Kafka client metrics. Every request has a correlation id on its log lines and in the `X-Request-Id` response header. JSON logs with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`. |
 
@@ -101,6 +102,14 @@ that is delivered again changes nothing. The load test found this.
 
 **The consumer does not read the ingest tables.** It keeps its own copy of what the
 events carry. It lives in this service for now, and could move out with its tables.
+
+**Punches are paged by position, not by page number.** The cursor is the time and id
+of the last punch returned, and the next page is `(punched_at_utc, id) > (cursor)` on
+an index with those columns. A page costs the same however deep it is, and a punch
+stored while someone is paging neither repeats nor pushes another off the page, which
+`OFFSET` cannot promise. The id breaks ties: an `IN` and an `OUT` in the same second
+are two punches with one timestamp, and `PunchQueryApiTest` puts a page boundary
+between them.
 
 **Webhooks are fed from Kafka, not from the ingest path.** The fan-out is one more
 consumer group on the topic. A subscriber over HTTP sees exactly what a Kafka consumer
@@ -159,6 +168,17 @@ curl -s -X POST localhost:8080/api/v1/devices/<DEVICE_ID>/punches \
 curl -s 'localhost:8080/api/v1/daily-summaries?employeeId=EMP-17&from=2026-09-01&to=2026-09-01' \
   -H 'X-Admin-Key: dev-admin-key'
 ```
+
+Read the punches back, a page at a time:
+
+```bash
+curl -s 'localhost:8080/api/v1/punches?employeeId=EMP-17&from=2026-09-01T00:00:00Z&to=2026-10-01T00:00:00Z&limit=100' \
+  -H 'X-Admin-Key: dev-admin-key'
+# -> {"punches":[...],"nextCursor":"<CURSOR>"}   nextCursor is null on the last page
+# Next page: the same request with &cursor=<CURSOR>
+```
+
+`from` is included and `to` is not, both as UTC instants.
 
 API documentation is served at `/swagger-ui.html`.
 

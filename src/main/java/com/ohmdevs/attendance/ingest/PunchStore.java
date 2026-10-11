@@ -49,6 +49,10 @@ class PunchStore {
     record StoredPunch(UUID id, AcceptedPunch punch) {
     }
 
+    record PunchView(UUID id, UUID deviceId, String siteCode, String userCode, String employeeId,
+                     LocalDateTime punchedAtLocal, Instant punchedAtUtc, PunchType type, Instant receivedAt) {
+    }
+
     /**
      * Inserts the punches that are not already stored and returns the ones that were new.
      *
@@ -172,6 +176,44 @@ class PunchStore {
                         row.getString("status"),
                         row.getObject("received_at", OffsetDateTime.class).toInstant()),
                 status, limit);
+    }
+
+    /**
+     * One employee's punches in a time range, oldest first, starting after the
+     * cursor when there is one. The row comparison walks the index on employee
+     * and time from that position instead of counting past skipped rows.
+     *
+     * @param to exclusive
+     */
+    List<PunchView> findPunches(String employeeId, Instant from, Instant to, PunchCursor after, int limit) {
+        List<Object> arguments = new ArrayList<>(List.of(employeeId, utc(from), utc(to)));
+        String afterCursor = "";
+        if (after != null) {
+            afterCursor = "AND (punched_at_utc, id) > (?, ?)";
+            arguments.add(utc(after.punchedAtUtc()));
+            arguments.add(after.id());
+        }
+        arguments.add(limit);
+        return jdbc.query("""
+                        SELECT id, device_id, site_code, user_code, employee_id, punched_at_local, punched_at_utc,
+                               type, received_at
+                          FROM punch
+                         WHERE employee_id = ? AND punched_at_utc >= ? AND punched_at_utc < ?
+                           %s
+                         ORDER BY punched_at_utc, id
+                         LIMIT ?
+                        """.formatted(afterCursor),
+                (row, n) -> new PunchView(
+                        row.getObject("id", UUID.class),
+                        row.getObject("device_id", UUID.class),
+                        row.getString("site_code"),
+                        row.getString("user_code"),
+                        row.getString("employee_id"),
+                        row.getObject("punched_at_local", LocalDateTime.class),
+                        row.getObject("punched_at_utc", OffsetDateTime.class).toInstant(),
+                        PunchType.valueOf(row.getString("type")),
+                        row.getObject("received_at", OffsetDateTime.class).toInstant()),
+                arguments.toArray());
     }
 
     private static void setInstant(PreparedStatement statement, int index, Instant instant) throws SQLException {

@@ -201,4 +201,14 @@ class PunchIngestApiTest extends AbstractIntegrationTest {
         assertThat(empty.getHeaders().getContentType().toString()).contains("application/problem+json");
         assertThat(badType.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
+
+    @Test
+    void theQuarantineListRejectsAnUnknownStatusOrLimit() {
+        for (String query : List.of("status=LOST", "limit=0", "limit=1001")) {
+            ResponseEntity<String> response = rest.exchange("/api/v1/quarantine?" + query, HttpMethod.GET,
+                    new HttpEntity<>(adminHeaders()), String.class);
+
+            assertThat(response.getStatusCode()).as(query).isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+    }
 }
