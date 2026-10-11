@@ -6,9 +6,10 @@ clock's own code for each person. This service stores each punch exactly once, c
 it to UTC, resolves the employee, sets aside what it cannot accept with the reason, and
 publishes a clean event to Kafka for every punch it stores.
 
-**Status: milestone 3 of 4.** Ingestion, idempotency, quarantine, event publication, the
-daily summary consumer, metrics and a clock simulator are done and tested. Webhooks for
-downstream systems are not built; see [Roadmap](#roadmap).
+**Status: milestone 4 of 4, in progress.** Ingestion, idempotency, quarantine, event
+publication, the daily summary consumer, metrics, a clock simulator and signed webhooks
+are done and tested. No downstream system consumes the events yet and the service is
+not deployed anywhere; see [Roadmap](#roadmap).
 
 ```text
 clocks --HTTP--> ingest --> PostgreSQL (punch + outbox_event, one transaction)
@@ -16,10 +17,12 @@ clocks --HTTP--> ingest --> PostgreSQL (punch + outbox_event, one transaction)
                             outbox publisher
                                    v
                      Kafka  attendance.punch.recorded.v1
-                                   |
-                     daily summary consumer --> PostgreSQL (daily_summary)
-                                   |
-                              failures --> attendance.punch.recorded.v1.dlq
+                          |                        |
+          daily summary consumer            webhook fan-out
+                          |                        |
+          PostgreSQL (daily_summary)   PostgreSQL (webhook_delivery)
+                          |                        |
+        failures --> ...recorded.v1.dlq    webhook dispatcher --signed HTTP--> subscribers
 ```
 
 ## The problem
@@ -45,7 +48,8 @@ repeats the cleanup.
 | Quarantine | A punch with no employee mapping, or dated in the future beyond a tolerance, is kept with its reason. After the mapping is fixed, `POST /api/v1/quarantine/reprocess` moves it through. |
 | Events | Every newly stored punch is published to `attendance.punch.recorded.v1`, keyed by employee. The contract is in [docs/events.md](docs/events.md). |
 | Daily summary | A consumer builds, per employee and day, first in, last out and worked minutes. `GET /api/v1/daily-summaries?employeeId=&from=&to=` reads it. |
-| Operations | Prometheus metrics at `/actuator/prometheus`: punches by outcome, outbox backlog and the age of its oldest event, events consumed, Kafka client metrics. Every request has a correlation id on its log lines and in the `X-Request-Id` response header. JSON logs with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`. |
+| Webhooks | For systems that cannot consume Kafka: the same events, in batches, posted to a registered address and signed with HMAC-SHA256. Failed requests are retried with growing pauses; an endpoint that keeps failing is suspended and loses nothing once resumed. The contract is in [docs/webhooks.md](docs/webhooks.md). |
+| Operations | Prometheus metrics at `/actuator/prometheus`: punches by outcome, outbox backlog and the age of its oldest event, events consumed, webhook attempts and backlog, Kafka client metrics. Every request has a correlation id on its log lines and in the `X-Request-Id` response header. JSON logs with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`. |
 
 ## Design decisions
 
@@ -97,6 +101,26 @@ that is delivered again changes nothing. The load test found this.
 
 **The consumer does not read the ingest tables.** It keeps its own copy of what the
 events carry. It lives in this service for now, and could move out with its tables.
+
+**Webhooks are fed from Kafka, not from the ingest path.** The fan-out is one more
+consumer group on the topic. A subscriber over HTTP sees exactly what a Kafka consumer
+sees, and a slow endpoint cannot hold back ingestion or the daily summary.
+
+**Retry state belongs to the subscription, not to each event.** An endpoint is either
+reachable or it is not. A failed batch stops that subscriber's queue and is sent again
+after a pause that doubles each time; newer events wait behind it instead of
+overtaking it. Per-event retries would be simpler to write and would deliver events
+out of order after every hiccup.
+
+**No database lock is held during an HTTP request.** The dispatcher claims a
+subscription with a single `UPDATE` that moves its next attempt to the end of a lease,
+sends without a transaction, and records the outcome afterwards. If it dies in between,
+the lease runs out and the batch is sent again. Each subscriber is sent to on its own
+virtual thread, so one endpoint that takes its whole timeout delays only itself.
+
+**An endpoint that keeps failing is suspended, not retried forever.** After ten
+failures in a row the subscription stops and waits for a person. Its events keep being
+queued, and `WebhookDeliveryTest` checks that resuming delivers all of them, in order.
 
 ## Running it
 
@@ -190,7 +214,8 @@ key and summary logic has plain unit tests.
 1. **Ingestion** — done.
 2. **Events** — done.
 3. **Operations** — done.
-4. **Integration** — signed webhooks for downstream systems.
+4. **Integration** — signed webhooks are done. Still open: a downstream system that
+   consumes the events, and a deployment.
 
 ## Limitations
 
@@ -201,7 +226,13 @@ key and summary logic has plain unit tests.
   belong behind the network boundary or on a separate management port.
 - One outbox publisher. A second instance would not lose or duplicate work, but events
   could be published out of insertion order.
-- Published outbox rows are never deleted.
+- Published outbox rows and delivered webhook rows are never deleted.
+- A webhook signing secret is stored as it is, because signing needs it. In a
+  deployment it belongs in an encrypted column or a secrets manager.
+- The service posts to whatever address an administrator registers, including ones
+  only reachable from inside its own network.
+- The measured throughput below was taken before webhooks existed and with no
+  subscribers. Webhook delivery has not been load tested.
 - A work day is the calendar day at the device, so a shift that crosses midnight is
   split across two summaries.
 - Two punches of the same type, by the same person, on the same device, with the same

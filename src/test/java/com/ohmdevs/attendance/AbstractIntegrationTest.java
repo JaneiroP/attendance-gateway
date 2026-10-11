@@ -63,6 +63,12 @@ public abstract class AbstractIntegrationTest {
         registry.add("attendance.outbox.poll-interval", () -> "200ms");
         registry.add("attendance.outbox.send-timeout", () -> "3s");
         registry.add("spring.kafka.producer.properties.max.block.ms", () -> "2000");
+        // Short enough that a test can watch a subscription be retried and then suspended.
+        registry.add("attendance.webhooks.poll-interval", () -> "100ms");
+        registry.add("attendance.webhooks.request-timeout", () -> "2s");
+        registry.add("attendance.webhooks.initial-backoff", () -> "200ms");
+        registry.add("attendance.webhooks.max-backoff", () -> "1s");
+        registry.add("attendance.webhooks.max-failures", () -> "6");
     }
 
     @Autowired

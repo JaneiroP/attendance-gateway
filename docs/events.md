@@ -52,8 +52,8 @@ topics run side by side while consumers move over.
 
 ## `attendance.punch.recorded.v1.dlq`
 
-Records that the daily summary consumer could not process. An unreadable message goes
-here at once. Any other failure is retried with growing pauses for about a minute, and
+Records that a consumer inside this service could not process. An unreadable message
+goes here at once, sent by the daily summary consumer. Any other failure is retried with growing pauses for about a minute, and
 then the records of that batch go here. The original value is kept
 unchanged, and the headers added by Spring Kafka carry the source topic, partition,
 offset and the exception.
