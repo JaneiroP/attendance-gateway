@@ -79,6 +79,29 @@ being queued for it. `POST .../resume` starts again from the oldest one.
 A later batch can contain more events than the failed one did, so a retry is not
 guaranteed to have the same body as the request before it.
 
+## A receiver: HRSaaS
+
+HRSaaS, a separate payroll project, implements this contract and stores each event as a
+time entry. The two share no code. What ties them together is the signature example
+above, which is a test vector on both sides.
+
+1. In HRSaaS, create an attendance connector
+   (`POST /api/v1/integrations/attendance-connectors`). The response has a
+   `webhookPath`.
+2. Here, subscribe with the HRSaaS host followed by that path. The response has the
+   secret.
+3. In HRSaaS, store the secret on the connector
+   (`PUT /api/v1/integrations/attendance-connectors/{id}/signing-secret`).
+
+Between steps 2 and 3 HRSaaS answers `401` and the events wait in the queue here.
+
+HRSaaS expects `employeeId` to be its own numeric employee id, so the mappings in this
+service (`PUT /api/v1/sites/{site}/mappings/{code}`) must use those ids. An event for an
+employee it does not know is skipped there, not rejected, so one bad mapping does not
+suspend the subscription.
+
+The two services have been tested each against the contract, not yet running together.
+
 ## Operating it
 
 | Metric | |

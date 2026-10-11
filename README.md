@@ -8,8 +8,8 @@ publishes a clean event to Kafka for every punch it stores.
 
 **Status: milestone 4 of 4, in progress.** Ingestion, idempotency, quarantine, event
 publication, the daily summary consumer, metrics, a clock simulator and signed webhooks
-are done and tested. No downstream system consumes the events yet and the service is
-not deployed anywhere; see [Roadmap](#roadmap).
+are done and tested. It has not yet been run together with a downstream system, and it
+is not deployed anywhere; see [Roadmap](#roadmap).
 
 ```text
 clocks --HTTP--> ingest --> PostgreSQL (punch + outbox_event, one transaction)
@@ -234,8 +234,10 @@ key and summary logic has plain unit tests.
 1. **Ingestion** — done.
 2. **Events** — done.
 3. **Operations** — done.
-4. **Integration** — signed webhooks are done. Still open: a downstream system that
-   consumes the events, and a deployment.
+4. **Integration** — signed webhooks are done, and HRSaaS (a separate project)
+   implements the receiving side; see
+   [docs/webhooks.md](docs/webhooks.md#a-receiver-hrsaas). Still open: running the two
+   together end to end, and a deployment.
 
 ## Limitations
 
